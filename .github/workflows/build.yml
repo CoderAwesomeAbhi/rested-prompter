@@ -1,0 +1,22 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swiftc --version
+      - run: bash build-mac.sh
+      - name: Self-test (number handling and a simulated read of every script)
+        run: '"Rested Prompter.app/Contents/MacOS/RestedPrompter" --selftest'
+      - name: Render screenshots
+        continue-on-error: true
+        run: '"Rested Prompter.app/Contents/MacOS/RestedPrompter" --snapshot shots'
+      - run: codesign --verify --verbose "Rested Prompter.app" && lipo -info "Rested Prompter.app/Contents/MacOS/RestedPrompter"
+      - run: ditto -c -k --keepParent "Rested Prompter.app" RestedPrompter-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rested-prompter-mac
+          path: |
+            RestedPrompter-mac.zip
+            shots/
