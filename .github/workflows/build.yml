@@ -1,22 +1,96 @@
 name: build
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: swiftc --version
-      - run: bash build-mac.sh
+      - run: sw_vers && swiftc --version
+      - run: bash mac/build-mac.sh
       - name: Self-test (number handling and a simulated read of every script)
-        run: '"Rested Prompter.app/Contents/MacOS/RestedPrompter" --selftest'
-      - name: Render screenshots
-        continue-on-error: true
-        run: '"Rested Prompter.app/Contents/MacOS/RestedPrompter" --snapshot shots'
-      - run: codesign --verify --verbose "Rested Prompter.app" && lipo -info "Rested Prompter.app/Contents/MacOS/RestedPrompter"
-      - run: ditto -c -k --keepParent "Rested Prompter.app" RestedPrompter-mac.zip
+        run: '"mac/Rested Prompter.app/Contents/MacOS/RestedPrompter" --selftest'
+      - name: Self-test the Intel build through Rosetta
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 "mac/Rested Prompter.app/Contents/MacOS/RestedPrompter" --selftest
+          else
+            echo "Rosetta isn't installed on this runner, so the Intel half was only built, not run."
+          fi
+      - run: '"mac/Rested Prompter.app/Contents/MacOS/RestedPrompter" --snapshot shots'
+      - run: codesign --verify --verbose "mac/Rested Prompter.app" && lipo -info "mac/Rested Prompter.app/Contents/MacOS/RestedPrompter"
+      - run: cd mac && ditto -c -k --keepParent "Rested Prompter.app" ../RestedPrompter-mac.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: rested-prompter-mac
+          name: mac
           path: |
             RestedPrompter-mac.zip
             shots/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build RestedPrompter.exe
+        shell: pwsh
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $speech = Get-ChildItem "$env:WINDIR\Microsoft.NET\assembly\GAC_MSIL\System.Speech" -Recurse -Filter System.Speech.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $speech) { $speech = Get-ChildItem "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework" -Recurse -Filter System.Speech.dll | Select-Object -Last 1 }
+          & $csc -nologo -codepage:65001 -target:winexe -optimize+ -out:RestedPrompter.exe "-r:$($speech.FullName)" -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Core.dll windows\RestedPrompter.cs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: RestedPrompter.exe
+
+  release:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish to Releases
+        run: |
+          if gh release view v1.0 >/dev/null 2>&1; then
+            gh release upload v1.0 mac/RestedPrompter-mac.zip windows/RestedPrompter.exe --clobber
+          else
+            gh release create v1.0 mac/RestedPrompter-mac.zip windows/RestedPrompter.exe --title "Rested Prompter" \
+              --notes "Mac: open Terminal and run \`curl -fsSL https://raw.githubusercontent.com/${GH_REPO}/main/install.sh | bash\`, or download RestedPrompter-mac.zip below. Windows: download RestedPrompter.exe. Instructions are in the README."
+          fi
+
+  install-test:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: sw_vers
+      - name: Install with the README's one-line command
+        run: curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh" | bash
+      - name: Check it's installed, unquarantined, signed and running
+        run: |
+          APP="/Applications/Rested Prompter.app"; [ -d "$APP" ] || APP="$HOME/Applications/Rested Prompter.app"
+          ls -la "$APP/Contents/MacOS"
+          if xattr -p com.apple.quarantine "$APP" 2>/dev/null; then echo "still quarantined"; exit 1; fi
+          codesign --verify --verbose "$APP"
+          "$APP/Contents/MacOS/RestedPrompter" --selftest | head -1
+          for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x RestedPrompter && break; sleep 1; done
+          pgrep -x RestedPrompter
+          sleep 2
+          screencapture -x launched.png || true
+          pgrep -x RestedPrompter && echo "Rested Prompter is open and still running"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: launched-${{ matrix.os }}
+          path: launched.png
+          if-no-files-found: ignore
